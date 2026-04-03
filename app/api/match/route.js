@@ -1,6 +1,5 @@
 import { NextResponse } from 'next/server';
 import { GoogleGenAI, Type } from '@google/genai';
-import pdfParse from 'pdf-parse';
 import * as mammoth from 'mammoth';
 
 export const maxDuration = 60; // Next.js serverless function timeout
@@ -16,45 +15,17 @@ export async function POST(request) {
     if (!jd) return NextResponse.json({ error: 'Missing Job Description' }, { status: 400 });
     if (!files || files.length === 0) return NextResponse.json({ error: 'No files uploaded' }, { status: 400 });
 
-    // 1. Phân tích nội dung các File CV
-    const cvContents = [];
-    for (const file of files) {
-      try {
-        const arrayBuffer = await file.arrayBuffer();
-        const buffer = Buffer.from(arrayBuffer);
-        let text = '';
-
-        if (file.name.toLowerCase().endsWith('.pdf')) {
-          const pdfData = await pdfParse(buffer);
-          text = pdfData.text;
-        } else if (file.name.toLowerCase().endsWith('.docx')) {
-          const result = await mammoth.extractRawText({ buffer });
-          text = result.value;
-        } else {
-          // Fallback cho text file
-          text = buffer.toString('utf8');
-        }
-
-        cvContents.push(`\n--- BẮT ĐẦU CV: ${file.name} ---\n${text.substring(0, 5000)}\n--- KẾT THÚC CV: ${file.name} ---`);
-      } catch (err) {
-        console.error(`Lỗi đọc file ${file.name}:`, err);
-        cvContents.push(`\n--- BẮT ĐẦU CV: ${file.name} ---\n(Không thể trích xuất nội dung file này)\n--- KẾT THÚC CV: ${file.name} ---`);
-      }
-    }
-
-    // 2. Chuyển cho Gemini chấm điểm
     const ai = new GoogleGenAI({ apiKey });
     
-    const prompt = `
-Bạn là một chuyên gia tuyển dụng nhân sự (HR Expert). Hãy đánh giá các ứng viên sau dựa trên Job Description (JD).
-
+    // Khởi tạo parts chứa JD text
+    const parts = [
+      { text: `Bạn là một chuyên gia tuyển dụng nhân sự (HR Expert). Hãy đánh giá các ứng viên từ các file CV (được đính kèm và trích xuất) dựa trên Job Description (JD).
+      
 [JOB DESCRIPTION]
 ${jd}
 
-[DANH SÁCH CV ỨNG VIÊN]
-${cvContents.join('\n')}
-
-Hãy đối chiếu từng CV với JD và trả về ĐÚNG cấu trúc JSON sau (dạng mảng các object). Chỉ trả về JSON, không kèm định dạng markdown (như \`\`\`json) hay văn bản giải thích nào khác.
+[YÊU CẦU ĐÁNH GIÁ]
+Hãy đối chiếu từng CV với JD và trả về ĐÚNG cấu trúc JSON sau (dạng mảng các object). Chỉ trả về JSON, không kèm định dạng markdown hay văn bản giải thích nào khác.
 
 [
   {
@@ -64,12 +35,41 @@ Hãy đối chiếu từng CV với JD và trả về ĐÚNG cấu trúc JSON sa
     "gaps": ["Khoảng trống/điểm yếu 1", "Khoảng trống 2", "... tối đa 2 điểm"],
     "status": "Shortlist" HOẶC "Review thêm" HOẶC "Chưa phù hợp"
   }
-]
-    `;
+]` }
+    ];
+
+    // Xử lý từng file CV
+    for (const file of files) {
+      try {
+        const arrayBuffer = await file.arrayBuffer();
+        const buffer = Buffer.from(arrayBuffer);
+
+        if (file.name.toLowerCase().endsWith('.pdf')) {
+          // Gemini hỗ trợ native PDF qua inlineData
+          parts.push({ text: `\nĐÂY LÀ FILE CV: ${file.name}\n---` });
+          parts.push({
+            inlineData: {
+              data: buffer.toString('base64'),
+              mimeType: 'application/pdf'
+            }
+          });
+        } else if (file.name.toLowerCase().endsWith('.docx') || file.name.toLowerCase().endsWith('.doc')) {
+          const result = await mammoth.extractRawText({ buffer });
+          const text = result.value;
+          parts.push({ text: `\nĐÂY LÀ NỘI DUNG CV: ${file.name}\n---\n${text.substring(0, 8000)}` });
+        } else {
+          const text = buffer.toString('utf8');
+          parts.push({ text: `\nĐÂY LÀ NỘI DUNG CV: ${file.name}\n---\n${text.substring(0, 8000)}` });
+        }
+      } catch (err) {
+        console.error(`Lỗi đọc file ${file.name}:`, err);
+        parts.push({ text: `\nĐÂY LÀ FILE CV: ${file.name}\n(Lỗi hệ thống không thể trích xuất)\n---` });
+      }
+    }
 
     const response = await ai.models.generateContent({
       model: 'gemini-2.5-flash',
-      contents: prompt,
+      contents: [{ role: 'user', parts }],
       config: {
         responseMimeType: "application/json",
         responseSchema: {
@@ -91,7 +91,6 @@ Hãy đối chiếu từng CV với JD và trả về ĐÚNG cấu trúc JSON sa
 
     const resultText = response.text;
     
-    // An toàn kiểm tra parse JSON
     let parsedData = [];
     try {
       parsedData = JSON.parse(resultText);
